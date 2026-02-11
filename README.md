@@ -1,93 +1,39 @@
-# Cociliacion-de-Datos
 import pandas as pd
 
-# 1. Cargar el Libro de Ventas (Saltando los encabezados decorativos)
-# El archivo 'Libro.csv' tiene datos reales a partir de la fila 5
-df_libro = pd.read_csv('01-FEBECA LVF 16-07-2025 AL 31-07-2025.xlsx - Libro .csv', skiprows=4)
-
-# 2. Cargar el Listado Contable
-df_conta = pd.read_csv('01-FEBECA LVF 16-07-2025 AL 31-07-2025.xlsx - 213041006.csv')
-
-# --- LIMPIEZA DE DATOS ---
-# Limpiar nombres de columnas
-df_libro.columns = df_libro.columns.str.strip()
-df_conta.columns = df_conta.columns.str.strip()
-
-# Normalizar RIF (Quitar espacios y poner en mayúsculas)
-df_libro['Num. R.I.F.'] = df_libro['Num. R.I.F.'].str.strip().str.upper()
-df_conta['Nit'] = df_conta['Nit'].str.strip().str.upper()
-
-# --- CONCILIACIÓN ---
-# Agrupar Libro por RIF (Sumamos 'IVA Retenido por Comprador')
-ventas_agrupado = df_libro.groupby('Num. R.I.F.')['IVA Retenido por Comprador'].sum().reset_index()
-
-# Agrupar Contabilidad por RIF (Sumamos 'Débitos Local' ya que las retenciones suelen cargarse ahí)
-# Nota: Verifica si en tu caso es 'Débitos Local' o 'Créditos Local'
-conta_agrupado = df_conta.groupby('Nit')['Débitos Local'].sum().reset_index()
-
-# Cruzar ambos datos
-conciliacion = pd.merge(
-    ventas_agrupado, 
-    conta_agrupado, 
-    left_on='Num. R.I.F.', 
-    right_on='Nit', 
-    how='outer'
-).fillna(0)
-
-# Calcular diferencia
-conciliacion['Diferencia'] = conciliacion['IVA Retenido por Comprador'] - conciliacion['Débitos Local']
-
-# Filtrar solo lo que no cuadra (margen de 0.01 por decimales)
-diferencias = conciliacion[conciliacion['Diferencia'].abs() > 0.01]
-
-# Renombrar para mayor claridad
-diferencias = diferencias.rename(columns={
-    'Num. R.I.F.': 'RIF',
-    'IVA Retenido por Comprador': 'Monto_Libro',
-    'Débitos Local': 'Monto_Conta'
-})
-
-print("### REPORTE DE DIFERENCIAS ENCONTRADAS ###")
-print(diferencias[['RIF', 'Monto_Libro', 'Monto_Conta', 'Diferencia']])
-
-# Guardar a Excel para revisar
-# diferencias.to_excel('diferencias_retenciones.xlsx', index=False)
-import streamlit as st
-import pandas as pd
-import io
-
-# Configuración de la página
-st.set_page_config(page_title="Conciliador de Retenciones", layout="wide")
-
-st.title("📊 Conciliación de Retenciones IVA")
-
-# --- FUNCIONES DE PROCESAMIENTO (CON CACHÉ PARA EVITAR ERRORES DE DOM) ---
-@st.cache_data
-def procesar_archivos(file_libro, file_conta):
-    # 1. Cargar Libro de Ventas (Salto de 4 filas según tu archivo)
-    df_libro = pd.read_csv(file_libro, skiprows=4)
-    df_libro.columns = df_libro.columns.str.strip()
-    
-    # 2. Cargar Contabilidad
+def conciliar_contabilidad(file_libro, file_conta):
+    # 1. Cargar datos
+    df_libro = pd.read_csv(file_libro)
     df_conta = pd.read_csv(file_conta)
+
+    # Limpieza de nombres de columnas
+    df_libro.columns = df_libro.columns.str.strip()
     df_conta.columns = df_conta.columns.str.strip()
 
-    # 3. Normalizar RIF (Eliminar guiones, espacios y asegurar mayúsculas)
+    # 2. Función de limpieza de RIF (Normalización)
     def clean_rif(text):
         if pd.isna(text): return ""
         return str(text).replace("-", "").replace(" ", "").upper()
 
+    # 3. Función para limpiar montos (Convertir "1.000,50" a float 1000.50)
+    def clean_currency(value):
+        if isinstance(value, str):
+            # Quitamos puntos de miles y cambiamos coma decimal por punto
+            value = value.replace('.', '').replace(',', '.')
+        return pd.to_numeric(value, errors='coerce') or 0.0
+
+    # Aplicar limpiezas
     df_libro['RIF_KEY'] = df_libro['Num. R.I.F.'].apply(clean_rif)
     df_conta['RIF_KEY'] = df_conta['Nit'].apply(clean_rif)
-
-    # 4. Agrupar montos
-    # En el libro sumamos 'IVA Retenido por Comprador'
-    libro_agrupado = df_libro.groupby('RIF_KEY')['IVA Retenido por Comprador'].sum().reset_index()
     
-    # En contabilidad sumamos 'Débitos Local'
+    # Limpiar columnas de montos antes de agrupar
+    df_libro['IVA Retenido por Comprador'] = df_libro['IVA Retenido por Comprador'].apply(clean_currency)
+    df_conta['Débitos Local'] = df_conta['Débitos Local'].apply(clean_currency)
+
+    # 4. Agrupar montos por RIF
+    libro_agrupado = df_libro.groupby('RIF_KEY')['IVA Retenido por Comprador'].sum().reset_index()
     conta_agrupado = df_conta.groupby('RIF_KEY')['Débitos Local'].sum().reset_index()
 
-    # 5. Cruzar datos
+    # 5. Cruzar datos (Outer join para no perder registros de ningún lado)
     df_final = pd.merge(
         libro_agrupado, 
         conta_agrupado, 
@@ -95,11 +41,13 @@ def procesar_archivos(file_libro, file_conta):
         how='outer'
     ).fillna(0)
 
-    # 6. Calcular diferencias
-    df_final['Diferencia'] = df_final['IVA Retenido por Comprador'] - df_final['Débitos Local']
+    # 6. Calcular diferencias y redondear a 2 decimales
+    df_final['Diferencia'] = (df_final['IVA Retenido por Comprador'] - df_final['Débitos Local']).round(2)
     
-    return df_final
+    # Renombrar para mayor claridad en el reporte
+    df_final.columns = ['RIF', 'Monto_Libro', 'Monto_Contabilidad', 'Diferencia']
 
+    return df_final
 # --- INTERFAZ DE USUARIO ---
 st.info("Sube tus archivos para comenzar. El sistema recordará los datos aunque cambies de pestaña.")
 
